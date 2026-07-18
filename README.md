@@ -14,8 +14,9 @@ só para macOS.
   **7d** e — quando o plano mede Opus à parte — de **opus**, cada uma com o
   horário de reset e a contagem regressiva.
 - **Demais contas** do `cswap`, cada uma com as **duas barras** (sessão de 5h e
-  semanal de 7d) quando há dado fresco. Sem dado, a linha só diz o motivo
-  (token expirado / API limitando) — **nunca um número cacheado**.
+  semanal de 7d) e o tempo pro reset de cada uma, quando há dado fresco. Sem
+  dado, a linha só diz o motivo (token expirado / API limitando) — **nunca um
+  número cacheado**.
 - **Ícone da bandeja**: um anel que mostra a janela de **sessão (5h)** da conta
   ativa (verde < 60% < âmbar < 85% < vermelho). É o número que responde "vou
   bater no limite agora?", sem precisar nem do hover.
@@ -100,8 +101,8 @@ O cswap renova o token da conta inativa ao listar, então na maioria das vezes
 elas aparecem com dados. Se ainda assim uma conta não tiver dado fresco, a linha
 mostra só o motivo (`token expirado`, `re-login preciso`, etc.) e encolhe — o app
 **nunca inventa um número cacheado**. Nas linhas compactas aparecem só as duas
-barras que importam de relance (sessão 5h e semanal 7d); o detalhe por modelo
-(Fable) fica no card da conta ativa.
+barras que importam de relance (sessão 5h e semanal 7d), cada uma com o tempo
+pro reset embaixo; o detalhe por modelo (Fable) fica no card da conta ativa.
 
 ## Como funciona por dentro
 
