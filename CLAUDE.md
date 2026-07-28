@@ -5,6 +5,10 @@ PowerShell 5.1 + WinForms, empacotado com `ps2exe`. Visão geral, dados e decis�
 de produto estão no [`README.md`](README.md) — este arquivo é só o que **quebra**
 se você ignorar.
 
+**Memória/decisões deste projeto:** `C:\Dev\cerebro\projetos\claude-usage-tray.md`
+(local desta máquina — ler antes de decisão não-trivial: pendências abertas,
+decisões recentes).
+
 ## Invariantes
 
 1. **A fonte de dados é `cswap --list --json`, não a API direta.** O `Collect`
