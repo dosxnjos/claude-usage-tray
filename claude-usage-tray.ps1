@@ -187,6 +187,13 @@ function Get-UsageColor([int]$pct) {
     return [System.Drawing.Color]::FromArgb(48, 164, 108)
 }
 
+# Where the tray ring switches to its zoomed scale (see New-RingIcon). ONE
+# threshold on purpose: each extra one is another scale the user would have to
+# identify at a glance in 16 pixels. 90 also happens to be where `cswap auto`
+# starts considering a switch, so the icon changes meaning exactly where the
+# engine changes behaviour.
+$TAIL_FROM_PCT = 90
+
 # ---------------------------------------------------------------------------
 # Talking to cswap (the ONLY path that writes credentials)
 # ---------------------------------------------------------------------------
@@ -733,19 +740,43 @@ function New-RingIcon($pct, [bool]$stale) {
 
     if ($null -ne $pct) {
         $p = [math]::Max(0, [math]::Min(100, [int]$pct))
+
+        # Above $TAIL_FROM_PCT the ring changes scale: that last stretch takes
+        # the whole circle, so 95% is half a turn and 98% is four fifths. At the
+        # normal scale those readings are the SAME icon - 2% of usage is 7
+        # degrees of arc, under one pixel at 16px, which is the size this thing
+        # actually lives at. The centre dot says "you're reading the zoomed
+        # scale". Colour disambiguates it even if the dot goes unnoticed: at the
+        # normal scale a barely-filled ring is green, never red.
+        $tail  = ($p -ge $TAIL_FROM_PCT)
+        $shown = if ($tail) { [int](100.0 * ($p - $TAIL_FROM_PCT) / (100.0 - $TAIL_FROM_PCT)) } else { $p }
+
         $arcColor = if ($stale) { $cStale } else { Get-UsageColor $p }
         $arcPen = New-Object System.Drawing.Pen($arcColor, $stroke)
         $arcPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
         $arcPen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
-        if ($p -ge 100) {
+        if ($shown -ge 100) {
             $g.DrawEllipse($arcPen, $box)
-        } elseif ($p -gt 0) {
+        } elseif ($shown -gt 0 -or $tail) {
             # Sweep clockwise from 12 o'clock. Floor a hair of sweep so a 1%
-            # reading still shows a visible tick rather than nothing.
-            $sweep = [single][math]::Max(8, 360.0 * $p / 100.0)
+            # reading still shows a visible tick rather than nothing - and so
+            # that exactly $TAIL_FROM_PCT (zero on the zoomed scale) reads as
+            # "start of the tail", not as an empty ring.
+            $sweep = [single][math]::Max(8, 360.0 * $shown / 100.0)
             $g.DrawArc($arcPen, $box, -90, $sweep)
         }
         $arcPen.Dispose()
+
+        if ($tail) {
+            # Centre dot: the one part of the icon nothing else uses, ~4px at
+            # 16px. Same colour as the arc, so a stale reading stays grey - the
+            # dot marks the scale, it never asserts urgency on its own.
+            $r  = [single]($ss * 0.17)
+            $cx = [single]($ss / 2.0)
+            $dot = New-Object System.Drawing.SolidBrush($arcColor)
+            $g.FillEllipse($dot, ($cx - $r), ($cx - $r), (2 * $r), (2 * $r))
+            $dot.Dispose()
+        }
     }
     $trackPen.Dispose()
     $g.Dispose()
@@ -1444,7 +1475,7 @@ if ($Preview) {
     # actually inspectable.
     # Two rows: live (top) and stale (bottom, grey arc) - the stale ring has no
     # text to explain itself, so it has to be checkable side by side.
-    $strip = New-Object System.Drawing.Bitmap(560, 184)
+    $strip = New-Object System.Drawing.Bitmap(628, 184)
     $sg = [System.Drawing.Graphics]::FromImage($strip)
     $sg.Clear([System.Drawing.Color]::FromArgb(24, 24, 27))
     $sg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
@@ -1452,7 +1483,9 @@ if ($Preview) {
     $rowY = 16
     foreach ($isStale in @($false, $true)) {
         $x = 12
-        foreach ($p in @(0, 12, 45, 72, 89, 100)) {
+        # The last four cross $TAIL_FROM_PCT: 89 is the normal scale, 93/96/100
+        # are the zoomed one - which is exactly the transition worth eyeballing.
+        foreach ($p in @(0, 45, 72, 89, 93, 96, 100)) {
             $h = New-RingIcon $p $isStale
             $ic = [System.Drawing.Icon]::FromHandle($h)
             $ib = $ic.ToBitmap()
@@ -1468,7 +1501,7 @@ if ($Preview) {
     $strip.Dispose()
 
     "popup -> $popupPng ($($popup.ClientSize.Width)x$($popup.ClientSize.Height) px, scale $($script:scale))"
-    "icons -> $iconPng (0, 12, 45, 72, 89, 100 % - linha 1 ao vivo, linha 2 stale)"
+    "icons -> $iconPng (0, 45, 72, 89, 93, 96, 100 % - linha 1 ao vivo, linha 2 stale)"
     exit 0
 }
 

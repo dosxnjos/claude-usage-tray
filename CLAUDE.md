@@ -80,6 +80,17 @@ decisões recentes).
    `Get-SessionPct` pega a barra `5h` (fallback: primeira barra). Se mudar para
    "pior janela", quebra o pedido.
 
+   **A partir de `$TAIL_FROM_PCT` (90%) o anel troca de escala:** a faixa
+   90→100 ocupa a volta inteira e um **ponto central** marca que a escala mudou.
+   Motivo medido (04/08/2026, `temp/ring-lab.ps1`): no tamanho real de 16px,
+   88/90/93/96/98/100% desenham o **mesmo ícone** — 2% de uso são 7° de arco,
+   menos de um pixel na borda. Descartados na mesma comparação: borda externa
+   vermelha (fina por definição, some no fundo escuro e ainda come pixel do
+   anel) e trilho vermelho (contraste baixo demais sob arco vermelho).
+   ⚠️ **Um limiar só.** Dois ou mais viram escalas que ninguém identifica de
+   relance em 16px. O ponto usa a **cor do arco** — em dado stale ele é cinza:
+   marca a escala, nunca afirma urgência sozinho.
+
 7. **As linhas das outras contas mostram só 5h e 7d; o card ativo mostra tudo.**
    Barras `scoped` (Fable, etc.) apertariam a linha compacta — ficam só no card
    da conta ativa, que tem espaço. Pedido explícito: "as duas barras, sessão e
