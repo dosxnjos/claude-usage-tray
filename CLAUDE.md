@@ -16,11 +16,27 @@ decisões recentes).
    deliberado e resolve três coisas que a chamada direta não resolvia:
    (a) o cswap **refresha tokens expirados** de contas inativas e reescreve o
    `.enc`, então uma conta morta volta sozinha — nós continuamos read-only, é o
-   cswap que rotaciona; (b) o **cache de 15s** do cswap absorve rajadas e evita
-   429; (c) ele já traz as janelas **por modelo** (`scoped[]`, ex. Fable). Há um
+   cswap que rotaciona; (b) o orçamento do endpoint de usage é **por access
+   token**, não por processo (medido pelo próprio cswap, ver `poll_policy.py`),
+   e o cswap concentra todas as suas superfícies num store compartilhado com
+   cadência adaptativa e backoff de 429 — uma segunda engine pollando por fora
+   não ganharia dado, dividiria o mesmo orçamento e derrubaria as duas em 429;
+   (c) ele já traz as janelas **por modelo** (`scoped[]`, ex. Fable). Há um
    fallback (API direta, conta logada) só para quando o cswap não está instalado.
    Nós nunca escrevemos `sequence.json`/`.enc` — trocar/remover também vão pelo
    `cswap` (`Invoke-Cswap`).
+
+   ⚠️ **Versão mínima: cswap 0.24.0** (invariante nº5 depende do `lastGoodUsage`,
+   nascido lá). Com um cswap mais velho nada quebra — o campo só não vem e a
+   conta lê como "sem dados".
+
+   ⚠️ **O vocabulário de `usageStatus` é snake_case** (`token_expired`,
+   `relogin_required`, `no_credentials`, `keychain_unavailable`, `api_key`,
+   `unavailable`), não as strings com espaço da grafia antiga. `Map-CswapStatus`
+   aceita as duas; se você acrescentar um status, acrescente nas duas grafias.
+   Histórico: o mapa ficou preso na grafia antiga e **todo** status virava
+   "API indisponivel" — uma conta pedindo re-login era reportada como queda da
+   API (corrigido em 03/08/2026).
 
 2. **Status vem do `usageStatus` do cswap, mapeado em `Map-CswapStatus`.**
    `ok`/`token expired`→`expired`/`re-login needed`→`relogin`/`no credentials`→
@@ -38,11 +54,27 @@ decisões recentes).
    60s e fica em memória; `Build-Popup` só desenha. Se você fizer o popup buscar
    dados na hora de abrir, perdeu o ponto do app.
 
-5. **Sem cache por conta. O popup mostra só o último fetch.** Uma conta cujo
-   fetch não retornou barras exibe o motivo (`Format-Status`), nunca um número
-   velho — decisão explícita do Gabriel: "5h: 90%" de horas atrás engana. O
-   snapshot em disco é só para pintar rápido no boot (o re-fetch de 3s corrige);
-   não reintroduza um `lastGood`/back-fill.
+5. **Nunca pintar número velho como se fosse atual — mas o velho *datado* vale.**
+   (Revisada em 03/08/2026; a regra original era "só o último fetch, ponto".)
+   O que continua proibido: **cache nosso**. Não reintroduza um `lastGood` ou
+   back-fill do lado do tray — o snapshot em disco segue existindo só para
+   pintar rápido no boot (o re-fetch de 3s corrige).
+
+   O que passou a ser permitido: o **`lastGoodUsage` do próprio cswap**. Desde a
+   0.24.0 o `--json` separa os dois grãos — `usage` é decision-grade (some assim
+   que envelhece) e `lastGoodUsage` é display-grade, **acompanhado de
+   `lastGoodAgeSeconds`**. Como o dado vem rotulado com a idade, dá para exibir
+   sem enganar. Regra de desenho: barra em `$cStale` (fora da escala
+   verde/âmbar/vermelho), percentual em `$cMuted`, anel da bandeja cinza, e a
+   idade **sempre visível** ("8h atras" na linha compacta, "medicao de 8h atras"
+   no card ativo). Nunca mostre o número sem a idade ao lado — é isso, e só
+   isso, que a decisão original queria evitar.
+
+   Por que a premissa mudou: em 03/08/2026 o tray ficou 8h em branco enquanto o
+   `cswap --list` mostrava tudo. Causa: conta at-limit na janela do Fable →
+   cswap adiava o poll até o reset (corrigido no cswap por #182) → `usage: null`
+   no JSON → barra vazia. Um "24% · 8h atras" cinza teria informado; "sem dados"
+   não informou nada.
 
 6. **O ícone da bandeja é a janela de SESSÃO (5h), não o pior/semanal.**
    `Get-SessionPct` pega a barra `5h` (fallback: primeira barra). Se mudar para
@@ -56,35 +88,37 @@ decisões recentes).
 8. **O arquivo `.ps1` é ASCII puro.** O PS 5.1 lê `.ps1` sem BOM como ANSI e
    corrompe literais não-ASCII. Glifos entram como `[char]0xNNNN`.
 
-9. **Auto-switch nunca usa `cswap --switch-to --force`.** O `--force` ativa a
-   credencial guardada **sem** fazer backup do login vivo primeiro; refresh
-   token é de uso único, então se o vivo girou depois do último backup, o
-   `--force` descarta a versão fresca e pode quebrar a conta. Sem exceções,
-   nem em fluxo automático nem manual.
+9. **Nunca use `cswap --switch-to --force`** (na troca manual — a automática
+   nem passa mais por aqui, ver nº10). O `--force` ativa a credencial guardada
+   **sem** fazer backup do login vivo primeiro; refresh token é de uso único,
+   então se o vivo girou depois do último backup, o `--force` descarta a
+   versão fresca e pode quebrar a conta. Sem exceções.
 
-10. **A decisão de auto-switch só roda sobre dado fresco, nunca sobre
-    snapshot.** `Invoke-AutoSwitch` (chamada no fim de `Complete-Refresh`)
-    sai cedo se `$script:stale` estiver true. O snapshot em disco existe só
-    para pintar a UI no boot (invariante nº5) — decidir uma troca de conta em
-    cima dele repetiria o mesmo erro que o snapshot foi desenhado pra evitar.
+10. **O tray NÃO decide auto-switch — delega ao `cswap auto` (desde
+    24/07/2026).** Com o toggle ligado, `$script:Collect` roda
+    `cswap auto --once --json` no runspace de fundo ANTES de buscar a lista
+    (uma troca já aparece no mesmo refresh) e devolve o envelope
+    `{accounts, auto}`; `Show-AutoSwitchEvents` só traduz eventos em balões.
+    A política inteira (threshold 90%, histerese 10 pts, cooldown 300s com
+    escape at-limit, freshening de token, quarentena, failover,
+    `autoswitch.model Fable` nesta máquina) é do cswap — ajuste com
+    `cswap config set autoswitch.*`, nunca recriando decisão local
+    (`Get-UsableAt`/`Get-AutoSwitchTarget` foram removidas de propósito:
+    duas engines sobre as mesmas credenciais = corrida).
 
-11. **Recusa de auto-switch vira retry silencioso + balão único, nunca
-    `MessageBox`.** `Invoke-AutoSwitch` roda fora de qualquer clique do
-    usuário (dispara do `Timer.Tick`); um modal aqui travaria a UI sem ninguém
-    olhando. `$script:autoSwitchWarned` garante um balão por episódio de
-    bloqueio, não um por tick de 60s.
+11. **Evento de auto-switch vira balão, nunca `MessageBox`.**
+    `Show-AutoSwitchEvents` roda fora de qualquer clique do usuário (dispara
+    do `Timer.Tick`); um modal aqui travaria a UI sem ninguém olhando.
+    `switch` → Info; `account-quarantined` → Warning (o engine só emite na
+    transição); `all-exhausted` → Warning **um por episódio**
+    (`$script:autoSwitchWarned`, re-armado quando o tick sai com exit 0/2).
+    O resto (below-threshold, histerese, erro transitório) é silêncio.
 
-12. **Auto-switch NÃO tem cooldown por tempo entre trocas — não reintroduza
-    um.** Uma versão inicial (17/07/2026) tinha um cooldown cego de 10min;
-    foi removido no mesmo dia. `Get-AutoSwitchTarget` já é auto-suficiente
-    contra oscilação: só dispara com a ativa travada, e devolve `$null` no
-    instante em que a própria ativa já é a "melhor" (inclusive quando ela É o
-    alvo pro qual acabamos de trocar). Um temporizador em cima disso não
-    adiciona proteção nenhuma — e mascara justamente o cenário que importa:
-    se a troca reverter sozinha (armadilha nº4 abaixo, seção de ambiente), um
-    cooldown ficaria confiando num sucesso que já não existe mais, atrasando
-    a nova tentativa pelo tempo inteiro do timer em vez de tentar de novo já
-    no próximo refresh (até 60s depois).
+12. **Não adicione cooldown/temporizador do tray por cima do auto-switch.**
+    O cooldown que existe é o do próprio cswap (300s, só proativo, com escape
+    at-limit) — dono da decisão, dono do ritmo. História: um cooldown cego de
+    10min no tray foi criado e removido em 17/07/2026; a decisão local
+    inteira saiu em 24/07/2026 com a delegação.
 
 ## Armadilhas do PowerShell 5.1 (não são bugs deste código — não "conserte")
 
@@ -172,10 +206,11 @@ Todas verificadas na marra neste projeto, no PS 5.1 do Windows 11
    `.claude.json` em memória e pode reescrevê-lo com a identidade antiga em
    alguma rotina própria) — mas não é garantia, só um dado a favor de nunca
    confiar no corpo do JSON. Por isso `Get-ActiveAccountNum` (via
-   `sequence.json`) continua sendo a única fonte confiável após qualquer
-   switch, automático ou manual, e o auto-switch reavalia a cada refresh
-   (60s) — se uma reversão silenciosa acontecer, a próxima rodada vê a conta
-   ainda travada e tenta de novo.
+   `sequence.json`) continua sendo a única fonte confiável após o switch
+   **manual**. (O automático saiu do tray em 24/07/2026 — invariante nº10:
+   quem decide E escreve é o próprio `cswap auto`, sob os locks dele, o que
+   fecha essa corrida para o caminho automático; e o refresh seguinte do tray
+   reflete o que quer que esteja no disco.)
 
 ## Detalhes de implementação que parecem gambiarra mas não são
 
@@ -199,7 +234,11 @@ Todas verificadas na marra neste projeto, no PS 5.1 do Windows 11
 ```powershell
 .\claude-usage-tray.ps1 -Once            # coleta uma vez, imprime o JSON, sai
 .\claude-usage-tray.ps1 -Preview .\out   # renderiza popup + anel em PNG
+cswap auto --once --dry-run --json       # simula o tick de auto-switch (nunca troca)
 ```
+
+O `-Once` é read-only por construção: o tick de auto-switch NÃO roda nele
+(o argumento `$AutoTick` do Collect só é passado pelo `Start-Refresh`).
 
 `-Preview` é a forma de conferir layout sem depender de passar o mouse num ícone
 vivo: ele usa `DrawToBitmap` (WM_PRINT), então a janela nem precisa estar visível.

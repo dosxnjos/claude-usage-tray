@@ -152,6 +152,10 @@ $cMuted  = [System.Drawing.Color]::FromArgb(184, 186, 198)
 $cTrack  = [System.Drawing.Color]::FromArgb(70, 70, 78)
 $cSubtle = [System.Drawing.Color]::FromArgb(150, 152, 164)
 $cLine   = [System.Drawing.Color]::FromArgb(52, 52, 58)
+# Fill for a bar drawn from cswap's lastGoodUsage. Deliberately OUTSIDE the
+# green/amber/red scale: the level is still worth reading, but the colour must
+# not shout urgency about a number that may already have moved.
+$cStale  = [System.Drawing.Color]::FromArgb(116, 118, 132)
 
 $reg = [System.Drawing.FontStyle]::Regular
 $FONT_TITLE = Fnt "Segoe UI Semibold" 14 $reg
@@ -275,7 +279,14 @@ $script:startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude
 # inbox PS 5.1 (same broken DLR/interpreter path that makes @() over a
 # New-Object List[object] throw). A string crosses intact; the caller parses it.
 # For the same reason this uses ArrayList rather than List[object] throughout.
+#
+# The string is an ENVELOPE: {"accounts":[...],"auto":{...}}. When $AutoTick is
+# true (the "Auto-switch de conta" toggle), one `cswap auto --once --json` tick
+# runs here FIRST - cswap's own engine decides and performs any switch, we only
+# carry its events back for balloons - and only then the account list is
+# fetched, so a switch is already visible in the same refresh.
 $script:Collect = {
+    param([bool]$AutoTick)
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     function Read-Json($path) {
@@ -314,16 +325,71 @@ $script:Collect = {
         } catch { return $null }
     }
 
+    # One `cswap auto --once --json` tick. The auto-switch decision AND the
+    # write both live in cswap (threshold/hysteresis/cooldown, token
+    # freshening, quarantine, failover - state persisted under its own file
+    # locks); this app only relays the JSONL events. Returns
+    # {Exit; Events[]} or $null when cswap is absent / times out / prints
+    # junk. 45s timeout: a tick may refresh a target's token or escalate to
+    # fetching every account's usage.
+    function Invoke-CswapAutoOnce {
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName  = 'cswap'
+            $psi.Arguments = 'auto --once --json'
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError  = $true
+            $psi.RedirectStandardInput  = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.CreateNoWindow = $true
+            $psi.EnvironmentVariables["PYTHONUTF8"]       = "1"
+            $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+            $psi.EnvironmentVariables["NO_COLOR"]         = "1"
+            $psi.EnvironmentVariables.Remove("FORCE_COLOR") | Out-Null
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.StandardInput.Close()
+            $errT = $p.StandardError.ReadToEndAsync()
+            $out  = $p.StandardOutput.ReadToEnd()
+            if (-not $p.WaitForExit(45000)) { try { $p.Kill() } catch {}; return $null }
+            $null = $errT.GetAwaiter().GetResult()
+            $code = -1
+            try { $code = $p.ExitCode } catch {}
+            try { $p.Dispose() } catch {}
+            $events = New-Object System.Collections.ArrayList
+            foreach ($line in ($out -split "`r?`n")) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                try { [void]$events.Add(($line | ConvertFrom-Json)) } catch {}
+            }
+            return [pscustomobject]@{ Exit = $code; Events = @($events) }
+        } catch { return $null }
+    }
+
     # cswap's usageStatus string -> our short status token.
+    #
+    # cswap emits snake_case (json_output.usage_fields); the space-separated
+    # forms are its older spelling, kept so a rollback of cswap doesn't silently
+    # turn every account into "unknown". An unmapped value is 'nodata', NOT
+    # 'offline': saying "API indisponivel" about a status we simply don't know
+    # is a claim we can't back - that mistake is exactly what made a
+    # relogin_required account read as an outage.
     function Map-CswapStatus($s) {
         switch ("$s") {
             'ok'                   { 'ok' }
+            'token_expired'        { 'expired' }
             'token expired'        { 'expired' }
+            'relogin_required'     { 'relogin' }
             're-login needed'      { 'relogin' }
+            'no_credentials'       { 'notoken' }
             'no credentials'       { 'notoken' }
+            'api_key'              { 'apikey' }
             'api key'              { 'apikey' }
+            'keychain_unavailable' { 'offline' }
             'keychain unavailable' { 'offline' }
-            default                { if ("$s") { 'offline' } else { 'ok' } }
+            # No usable measurement this pass (fetch failed, or the stored one is
+            # too old to act on). cswap still ships lastGoodUsage alongside it.
+            'unavailable'          { 'nodata' }
+            default                { if ("$s") { 'nodata' } else { 'ok' } }
         }
     }
 
@@ -337,22 +403,46 @@ $script:Collect = {
         }
     }
 
-    $out = New-Object System.Collections.ArrayList
-    $cj  = Invoke-CswapJson
+    # A whole usage object (cswap's `usage` OR `lastGoodUsage` - same shape)
+    # -> the bars, emitted one by one. Callers wrap the call in @() to get a
+    # real array (empty when there's nothing). Deliberately NOT `return
+    # ,$array`: that idiom nests one level here, and a nested array's .Count is
+    # always 1 - which silently made "no bars" look like "one bar".
+    function New-BarsFrom($u) {
+        if (-not $u) { return }
+        $b = New-BarFrom '5h' $u.fiveHour; if ($b) { $b }
+        $b = New-BarFrom '7d' $u.sevenDay; if ($b) { $b }
+        # Per-model windows (Fable today, maybe Opus later) - keep each,
+        # labelled by the model name cswap carries.
+        if ($u.scoped) {
+            foreach ($s in @($u.scoped)) {
+                $b = New-BarFrom "$($s.name)" $s; if ($b) { $b }
+            }
+        }
+    }
+
+    $out  = New-Object System.Collections.ArrayList
+    $auto = $null
+    if ($AutoTick) { $auto = Invoke-CswapAutoOnce }
+    $cj   = Invoke-CswapJson
 
     if ($cj -and $cj.accounts) {
         foreach ($ac in $cj.accounts) {
-            $bars = New-Object System.Collections.ArrayList
-            $u = $ac.usage
-            if ($u) {
-                $b = New-BarFrom '5h' $u.fiveHour; if ($b) { [void]$bars.Add($b) }
-                $b = New-BarFrom '7d' $u.sevenDay; if ($b) { [void]$bars.Add($b) }
-                # Per-model windows (Fable today, maybe Opus later) - keep each,
-                # labelled by the model name cswap carries.
-                if ($u.scoped) {
-                    foreach ($s in @($u.scoped)) {
-                        $b = New-BarFrom "$($s.name)" $s; if ($b) { [void]$bars.Add($b) }
-                    }
+            # `usage` is cswap's decision-grade value: it disappears the moment
+            # the measurement is too old to act on. cswap 0.24+ keeps shipping
+            # the last useful one in `lastGoodUsage`, stamped with
+            # `lastGoodAgeSeconds` - display-grade by contract. We draw that,
+            # dimmed and dated (revised invariant 5): a number the user can see
+            # is old beats "sem dados". Pre-0.24 cswap omits the field, and the
+            # account falls back to reading as no-data, exactly as before.
+            $stale = $false
+            $ageS  = $null
+            $bars  = @(New-BarsFrom $ac.usage)
+            if ($bars.Count -eq 0 -and $ac.lastGoodUsage) {
+                $bars = @(New-BarsFrom $ac.lastGoodUsage)
+                if ($bars.Count -gt 0) {
+                    $stale = $true
+                    if ($null -ne $ac.lastGoodAgeSeconds) { $ageS = [double]$ac.lastGoodAgeSeconds }
                 }
             }
             $status = Map-CswapStatus $ac.usageStatus
@@ -360,9 +450,11 @@ $script:Collect = {
                 Num = [int]$ac.number; Email = "$($ac.email)"; Org = "$($ac.organizationName)"
                 Active = [bool]$ac.active
                 Unavailable = ($bars.Count -eq 0); Status = $status; Bars = @($bars)
+                Stale = $stale; AgeS = $ageS
             })
         }
-        return ($out | ConvertTo-Json -Depth 6 -Compress)
+        return ([pscustomobject]@{ accounts = $out.ToArray(); auto = $auto } |
+            ConvertTo-Json -Depth 8 -Compress)
     }
 
     # ---- Fallback: no cswap. Direct API call for the logged-in account. ----
@@ -419,34 +511,41 @@ $script:Collect = {
         } catch {}
     }
     if ($status -eq 'ok' -and $bars.Count -eq 0) { $status = 'offline' }
+    # No store behind this path, so nothing can be stale: it's this second's
+    # answer or nothing. The fields exist only so both paths yield the same shape.
     [void]$out.Add([pscustomobject]@{
         Num = 1; Email = $email; Org = $org; Active = $true
         Unavailable = ($bars.Count -eq 0); Status = $status; Bars = @($bars)
+        Stale = $false; AgeS = $null
     })
-    return ($out | ConvertTo-Json -Depth 6 -Compress)
+    return ([pscustomobject]@{ accounts = $out.ToArray(); auto = $auto } |
+        ConvertTo-Json -Depth 8 -Compress)
 }
 
-# The other half of that contract: turn Collect's JSON back into accounts.
+# The other half of that contract: turn Collect's envelope JSON back into
+# {Accounts; Auto}. Auto is the raw `cswap auto --once` result ({Exit; Events})
+# or $null when the toggle was off / cswap missing.
 #
 # Two PS 5.1 traps here. ConvertFrom-Json emits a JSON array as ONE object, so
-# @(...) wraps it into a 1-element array instead of unrolling it - hence the
-# explicit walk. And a lone account serializes as a bare object rather than a
-# 1-element array, which the same walk handles. `,$list` keeps a single-account
-# result from being unrolled back into a bare object on return.
+# @(...) around a pipeline would wrap instead of unrolling - hence the explicit
+# walk. And a lone account can deserialize as a bare object rather than a
+# 1-element array, which the same walk handles.
 function ConvertFrom-CollectJson($raw) {
-    if ([string]::IsNullOrWhiteSpace("$raw")) { return ,@() }
+    $empty = [pscustomobject]@{ Accounts = @(); Auto = $null }
+    if ([string]::IsNullOrWhiteSpace("$raw")) { return $empty }
     try {
         $parsed = ConvertFrom-Json -InputObject "$raw"
         $list = @()
-        foreach ($x in $parsed) { $list += $x }
-        return ,$list
-    } catch { return ,@() }
+        foreach ($x in @($parsed.accounts)) { if ($x) { $list += $x } }
+        return [pscustomobject]@{ Accounts = $list; Auto = $parsed.auto }
+    } catch { return $empty }
 }
 
 if ($Once) {
-    # Straight on this thread - there's no UI to keep responsive. Round-trip the
-    # compact JSON through ConvertFrom/To so it prints readably.
-    ConvertFrom-CollectJson (& $script:Collect) | ConvertTo-Json -Depth 6
+    # Straight on this thread - there's no UI to keep responsive. Read-only by
+    # design: $AutoTick is not passed, so -Once can never switch accounts.
+    # Round-trip through ConvertFrom/To so the compact JSON prints readably.
+    (ConvertFrom-CollectJson (& $script:Collect)).Accounts | ConvertTo-Json -Depth 6
     exit 0
 }
 
@@ -468,7 +567,7 @@ $script:pinned    = $false
 $script:modal     = $false     # a dialog is up; hover must not hide the popup
 $script:busy      = $null      # text of an in-flight cswap action, or $null
 $script:menuOpen  = $false     # tray context menu is open; do NOT reopen the popup
-$script:autoSwitchWarned = $false   # one balloon per refusal episode, not one per tick
+$script:autoSwitchWarned = $false   # one all-exhausted balloon per episode, not one per tick
 $script:leaveAt   = 0
 $script:anchor    = [System.Drawing.Rectangle]::Empty
 $script:iconHandle = [IntPtr]::Zero
@@ -525,67 +624,6 @@ function Load-Settings {
 Load-Settings   # before the context menu is built, so the checkbox reflects the saved value
 
 # ---------------------------------------------------------------------------
-# Auto-switch decision (pure functions - no UI/IO state, safe to dot-source
-# and drive with fixtures)
-# ---------------------------------------------------------------------------
-# When an account becomes usable again. 100% is cswap's own rounding of a
-# window that is fully consumed; the 7d block outranks the 5h one because a
-# weekly cap makes the account dead regardless of what the session window
-# says. Returns $null when a blocking bar's ResetsAt can't be parsed - callers
-# must treat that as "don't know" (never guess a time), not as "usable now".
-function Get-UsableAt($acct) {
-    if (-not $acct) { return $null }
-    $bars = @($acct.Bars)
-    $sevenD = $null; $fiveH = $null
-    foreach ($b in $bars) {
-        if ("$($b.Label)" -eq '7d') { $sevenD = $b }
-        elseif ("$($b.Label)" -eq '5h') { $fiveH = $b }
-    }
-    foreach ($b in @($sevenD, $fiveH)) {
-        if ($b -and [int]$b.Pct -ge 100) {
-            try { return [datetimeoffset]::Parse("$($b.ResetsAt)") } catch { return $null }
-        }
-    }
-    return [datetimeoffset]::Now
-}
-
-# $null return means "do nothing": active account not blocked, blocked but we
-# can't tell when it clears, no eligible target, a tie, or the winner IS the
-# active account. Eligible target = Status 'ok' AND has a 5h bar (cswap did
-# return usage data for it, even if currently 0%).
-function Get-AutoSwitchTarget($accounts) {
-    $accounts = @($accounts)
-    if ($accounts.Count -eq 0) { return $null }
-    $active = $null
-    foreach ($a in $accounts) { if ($a.Active) { $active = $a; break } }
-    if (-not $active) { return $null }
-
-    $activeUsableAt = Get-UsableAt $active
-    if ($null -eq $activeUsableAt) { return $null }
-    if ($activeUsableAt -le [datetimeoffset]::Now) { return $null }
-
-    $bestAcct = $null
-    $bestAt   = $null
-    $tie      = $false
-    foreach ($a in $accounts) {
-        if ("$($a.Status)" -ne 'ok') { continue }
-        $hasFiveH = $false
-        foreach ($b in @($a.Bars)) { if ("$($b.Label)" -eq '5h') { $hasFiveH = $true; break } }
-        if (-not $hasFiveH) { continue }
-        $at = Get-UsableAt $a
-        if ($null -eq $at) { continue }
-        if ($null -eq $bestAt -or $at -lt $bestAt) {
-            $bestAcct = $a; $bestAt = $at; $tie = $false
-        } elseif ($at -eq $bestAt) {
-            $tie = $true
-        }
-    }
-    if ($null -eq $bestAcct -or $tie) { return $null }
-    if ($bestAcct.Active) { return $null }
-    return $bestAcct
-}
-
-# ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 function Format-ResetClock($iso) {
@@ -611,6 +649,27 @@ function Format-ResetRel($iso) {
     } catch { return "" }
 }
 
+# How old a measurement is, short and ASCII-only (invariant 8): "45s" / "8m" /
+# "3h" / "2d". One unit is enough - this qualifies a number, it isn't the number.
+function Format-Age($seconds) {
+    if ($null -eq $seconds) { return "" }
+    $s = [double]$seconds
+    if ($s -lt 0)     { $s = 0 }
+    if ($s -lt 60)    { return "{0}s" -f [int]$s }
+    if ($s -lt 3600)  { return "{0}m" -f [int][math]::Floor($s / 60) }
+    if ($s -lt 86400) { return "{0}h" -f [int][math]::Floor($s / 3600) }
+    return "{0}d" -f [int][math]::Floor($s / 86400)
+}
+
+# The age as the user reads it next to a dimmed bar. Falls back to a qualifier
+# with no number when cswap sent lastGoodUsage without lastGoodAgeSeconds -
+# never silence, or the number would look current.
+function Format-StaleTag($acct) {
+    $age = Format-Age $acct.AgeS
+    if ($age) { return "$age atras" }
+    return 'medicao antiga'
+}
+
 # Why an account has no live numbers, in words. 'expired' is the normal state of
 # an INACTIVE account (cswap only rewrites its .enc on switch), so it gets the
 # gentlest phrasing; a 429 must never be reported as an expired token.
@@ -618,6 +677,7 @@ function Format-Status($acct, [bool]$long) {
     switch ("$($acct.Status)") {
         'ratelimited' { return 'API limitando (429)' }
         'offline'     { return 'API indisponivel' }
+        'nodata'      { return 'sem medicao recente' }
         'notoken'     { return 'sem credencial salva' }
         'apikey'      { return 'conta usa API key (sem uso)' }
         'relogin'     { if ($long) { return 're-login preciso (cswap add)' } else { return 're-login preciso' } }
@@ -648,7 +708,10 @@ function Get-SessionPct($acct) {
 # ---------------------------------------------------------------------------
 # Drawn at 4x and downsampled so the arc has clean edges at 16-24px, where a
 # number would be illegible.
-function New-RingIcon($pct) {
+# $stale draws the arc grey instead of on the green/amber/red scale: the ring is
+# the one surface with no room to explain itself, so a stale reading must not
+# look like a live one. The number it shows is still the last one we know.
+function New-RingIcon($pct, [bool]$stale) {
     $target = [System.Windows.Forms.SystemInformation]::SmallIconSize.Width
     if ($target -lt 16) { $target = 16 }
     $ss = $target * 4
@@ -670,7 +733,8 @@ function New-RingIcon($pct) {
 
     if ($null -ne $pct) {
         $p = [math]::Max(0, [math]::Min(100, [int]$pct))
-        $arcPen = New-Object System.Drawing.Pen((Get-UsageColor $p), $stroke)
+        $arcColor = if ($stale) { $cStale } else { Get-UsageColor $p }
+        $arcPen = New-Object System.Drawing.Pen($arcColor, $stroke)
         $arcPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
         $arcPen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
         if ($p -ge 100) {
@@ -701,7 +765,7 @@ function Update-TrayIcon {
     $acct = Get-ActiveAccount
     $pct  = Get-SessionPct $acct
 
-    $hicon = New-RingIcon $pct
+    $hicon = New-RingIcon $pct ([bool]$acct.Stale)
     $newIcon = [System.Drawing.Icon]::FromHandle($hicon)
 
     $oldHandle = $script:iconHandle
@@ -816,79 +880,60 @@ function Remove-Account($acct) {
     Start-Refresh
 }
 
-# Auto-switch: when the ACTIVE account is blocked, hop to whichever eligible
-# account becomes usable soonest (see Get-AutoSwitchTarget). Called from
-# Complete-Refresh, right after fresh data lands - never from a stale/boot
-# snapshot, so the decision is always made on data no older than this round.
+# Auto-switch: the DECISION and the WRITE both live in cswap now. The
+# background Collect runs `cswap auto --once --json` (when the toggle is on)
+# right before fetching the account list, so any switch is already reflected
+# in the same refresh - no extra re-fetch, no post-hoc confirmation. cswap's
+# engine owns the whole policy: proactive threshold (default 90%) with a
+# hysteresis margin, a cooldown that an at-limit account bypasses, token
+# freshening of the target, quarantine of dead refresh tokens, and failover
+# when the active account's usage turns unreadable. It persists its own state
+# (autoswitch_state.json) under file locks, which also closes the old
+# "switched:true but silently reverted" race this app used to re-check for
+# with Get-ActiveAccountNum - the checker and the switcher are the same
+# process now. Tune it with `cswap config set autoswitch.*`, not here.
 #
-# --force is NEVER used here: it would activate a stored credential without
-# backing up whatever live token is currently on disk, and refresh tokens are
-# single-use - if the live one rotated since the last backup, --force silently
-# discards it and can brick that account's login. cswap's switch_to has no
-# hard live-session block (only remove does) and normally writes through, but
-# its JSON body claiming "switched": true has been observed NOT to guarantee
-# the write persisted (see roadmap Descobertas da F1 - not reliably
-# reproducible, mechanism unconfirmed: possibly another already-running Claude
-# Code process, of which there are routinely many on this machine, silently
-# overwriting ~/.claude.json with its own cached identity some time later).
-# So success is judged ONLY by Get-ActiveAccountNum, same rule as
-# Switch-Account/Remove-Account.
-#
-# Deliberately NO time-based cooldown between automatic switches (an earlier
-# version had one - removed 2026-07-17). Get-AutoSwitchTarget is already a
-# complete anti-flapping guard by itself: it only fires while the active
-# account is blocked, and returns null the instant the current active account
-# IS the best option (including "it's already the target we just switched
-# to"). A blind timer on top of that added no protection Get-AutoSwitchTarget
-# didn't already provide, while actively hiding the one failure mode that
-# matters here: if a silent revert (above) puts the blocked account back as
-# active, a timer would suppress noticing that for its whole duration instead
-# of retrying on the very next refresh.
-function Invoke-AutoSwitch {
-    if (-not $script:autoSwitchEnabled) { return }
-    if ($script:busy) { return }
-    if ($script:stale) { return }
-
-    $active = Get-ActiveAccount
-    $activeUsableAt = Get-UsableAt $active
-    if ($null -ne $activeUsableAt -and $activeUsableAt -le [datetimeoffset]::Now) {
-        $script:autoSwitchWarned = $false   # active cleared up on its own since the last look
-        return
-    }
-
-    $target = Get-AutoSwitchTarget $script:data
-    if (-not $target) { return }
-
-    $script:busy = "trocando de conta (automatico)..."
-    if ($script:visible) { Build-Popup }
-
-    $r = Invoke-Cswap @('--switch-to', "$($target.Num)")
-    $script:busy = $null
-
-    if ($r.Ok -and (Get-ActiveAccountNum) -eq [int]$target.Num) {
-        $script:autoSwitchWarned = $false
-        $resetTxt = if ($activeUsableAt) { Format-ResetClock ($activeUsableAt.ToString('o')) } else { '' }
-        $msg = if ($resetTxt) {
-            "Conta trocada automaticamente para $($target.Num) ($($target.Email)) - conta anterior reseta $resetTxt"
-        } else {
-            "Conta trocada automaticamente para $($target.Num) ($($target.Email))"
+# This function only translates the tick's events into balloons. It runs
+# unattended off the refresh timer, so it must never block or open a modal:
+#   switch              -> info balloon (the fresh list already shows it)
+#   account-quarantined -> warning balloon (engine emits only on transition)
+#   all-exhausted       -> warning balloon, ONE per episode (autoSwitchWarned)
+#   exit 0/2            -> episode over: re-arm the all-exhausted balloon
+# Everything else (below-threshold, hysteresis misses, transient errors) is
+# routine - stay silent and let the next refresh re-evaluate.
+function Show-AutoSwitchEvents($auto) {
+    if (-not $auto -or $null -eq $auto.Events) { return }
+    foreach ($ev in @($auto.Events)) {
+        switch ("$($ev.event)") {
+            'switch' {
+                if (-not $ev.dryRun -and $ev.to) {
+                    $from = if ($ev.from) { "$($ev.from.number)" } else { '?' }
+                    $msg = "Conta trocada automaticamente: $from -> $($ev.to.number) ($($ev.to.email)) [$($ev.trigger)]"
+                    try { $notify.ShowBalloonTip(4000, 'Claude Usage', $msg, [System.Windows.Forms.ToolTipIcon]::Info) } catch {}
+                }
+            }
+            'account-quarantined' {
+                $msg = "Conta $($ev.number) ($($ev.email)) em quarentena: $($ev.reason). Recupere com 'cswap --add-account --slot $($ev.number)'."
+                try { $notify.ShowBalloonTip(5000, 'Claude Usage', $msg, [System.Windows.Forms.ToolTipIcon]::Warning) } catch {}
+            }
+            'all-exhausted' {
+                if (-not $script:autoSwitchWarned) {
+                    $script:autoSwitchWarned = $true
+                    $when = ''
+                    if ($ev.earliestResetAt) {
+                        $clock = Format-ResetClock "$($ev.earliestResetAt)"
+                        if ($clock) { $when = " Reset mais cedo: $clock." }
+                    }
+                    try {
+                        $notify.ShowBalloonTip(5000, 'Claude Usage',
+                            "Todas as contas esgotadas - sem alvo para troca automatica.$when",
+                            [System.Windows.Forms.ToolTipIcon]::Warning)
+                    } catch {}
+                }
+            }
         }
-        try { $notify.ShowBalloonTip(4000, 'Claude Usage', $msg, [System.Windows.Forms.ToolTipIcon]::Info) } catch {}
-        Start-Refresh
-    } elseif (-not $script:autoSwitchWarned) {
-        # cswap reported failure, OR its JSON claimed success but the account
-        # didn't actually land on the target (see the comment above this
-        # function) - either way, warn once per episode and let the next
-        # refresh retry silently. No MessageBox: this path runs unattended off
-        # a timer tick.
-        $script:autoSwitchWarned = $true
-        try {
-            $notify.ShowBalloonTip(4000, 'Claude Usage',
-                'Troca automatica de conta nao foi confirmada. Nova tentativa no proximo refresh.',
-                [System.Windows.Forms.ToolTipIcon]::Warning)
-        } catch {}
     }
-    if ($script:visible) { Build-Popup }
+    if ($auto.Exit -eq 0 -or $auto.Exit -eq 2) { $script:autoSwitchWarned = $false }
 }
 
 # ---------------------------------------------------------------------------
@@ -903,7 +948,7 @@ function Start-Refresh {
         $rs.Open()
         $ps = [powershell]::Create()
         $ps.Runspace = $rs
-        [void]$ps.AddScript($script:Collect)
+        [void]$ps.AddScript($script:Collect).AddArgument([bool]$script:autoSwitchEnabled)
         $script:job = [pscustomobject]@{ PS = $ps; RS = $rs; Handle = $ps.BeginInvoke() }
         $pollTimer.Start()
     } catch {
@@ -927,14 +972,15 @@ function Complete-Refresh {
     try { $job.PS.Dispose() } catch {}
     try { $job.RS.Close(); $job.RS.Dispose() } catch {}
 
-    $accounts = ConvertFrom-CollectJson $raw
+    $parsed = ConvertFrom-CollectJson $raw
+    $accounts = @($parsed.Accounts)
     if ($accounts.Count -gt 0) {
         $script:data      = $accounts
         $script:updatedAt = Get-Date
         $script:stale     = $false
         Save-Snapshot
         Update-TrayIcon
-        try { Invoke-AutoSwitch } catch {}
+        try { Show-AutoSwitchEvents $parsed.Auto } catch {}
 
         # Back off when Anthropic throttles us. One tray poll per minute times N
         # accounts, alongside cswap's own calls, is enough to earn a 429 - and a
@@ -1008,7 +1054,7 @@ function New-Label($text, $font, $color, $x, $y, $w, $h, $align) {
     return $l
 }
 
-function New-Bar($parent, $x, $y, $w, $h, $pct) {
+function New-Bar($parent, $x, $y, $w, $h, $pct, $fillColor) {
     $track = New-Object System.Windows.Forms.Panel
     $track.BackColor = $cTrack
     $track.Location = Pt $x $y
@@ -1018,7 +1064,7 @@ function New-Bar($parent, $x, $y, $w, $h, $pct) {
         # Floor at 2px so a 1% reading is still visibly non-zero.
         $fillW = [math]::Max(2, [int]((Px $w) * ([math]::Min(100, [int]$pct) / 100.0)))
         $fill = New-Object System.Windows.Forms.Panel
-        $fill.BackColor = (Get-UsageColor ([int]$pct))
+        $fill.BackColor = if ($fillColor) { $fillColor } else { Get-UsageColor ([int]$pct) }
         $fill.Location = New-Object System.Drawing.Point(0, 0)
         $fill.Size = New-Object System.Drawing.Size($fillW, (Px $h))
         $track.Controls.Add($fill)
@@ -1028,15 +1074,19 @@ function New-Bar($parent, $x, $y, $w, $h, $pct) {
 
 # One labelled bar with its percentage and reset time. Returns the next y.
 # labelW is wide enough for a model name like "Fable"/"opus", not just "5h".
-function Add-UsageRow($card, $bar, $y, $cardW) {
+# $stale dims the whole row (grey fill, muted percentage): same information,
+# visibly demoted, so it can never be mistaken for this minute's reading.
+function Add-UsageRow($card, $bar, $y, $cardW, [bool]$stale) {
     $labelW = 44
     $pctW   = 42
     $barX   = 12 + $labelW
     $barW   = $cardW - $barX - $pctW - 12
+    $fill   = if ($stale) { $cStale } else { $null }
+    $pctCol = if ($stale) { $cMuted } else { $cText }
 
     $card.Controls.Add((New-Label $bar.Label $FONT_ROW $cMuted 12 $y $labelW 15 $null))
-    New-Bar $card $barX ($y + 4) $barW $BAR_H ([int]$bar.Pct) | Out-Null
-    $card.Controls.Add((New-Label ("{0}%" -f [int]$bar.Pct) $FONT_ROW $cText ($barX + $barW + 4) ($y - 1) $pctW 16 'MiddleRight'))
+    New-Bar $card $barX ($y + 4) $barW $BAR_H ([int]$bar.Pct) $fill | Out-Null
+    $card.Controls.Add((New-Label ("{0}%" -f [int]$bar.Pct) $FONT_ROW $pctCol ($barX + $barW + 4) ($y - 1) $pctW 16 'MiddleRight'))
 
     $clock = Format-ResetClock $bar.ResetsAt
     if ($clock) {
@@ -1146,12 +1196,25 @@ function Build-Popup {
         }
         $cy += 4
 
-        $aBars = @($active.Bars)
+        $aBars  = @($active.Bars)
+        $aStale = [bool]$active.Stale
         if ($aBars.Count -eq 0) {
             $card.Controls.Add((New-Label ("sem dados - " + (Format-Status $active $true)) $FONT_ROW $cMuted 12 $cy ($cardW - 40) 18 $null))
             $cy += 22
         } else {
-            foreach ($b in $aBars) { $cy = Add-UsageRow $card $b $cy $cardW }
+            foreach ($b in $aBars) { $cy = Add-UsageRow $card $b $cy $cardW $aStale }
+            if ($aStale) {
+                # Said once under the bars, not per row: they all come from the
+                # same lastGoodUsage snapshot. The reason is appended only when
+                # it adds something - "sem medicao recente" next to the age is
+                # the same sentence twice.
+                $tag = 'medicao de ' + (Format-StaleTag $active)
+                if ("$($active.Status)" -ne 'nodata' -and "$($active.Status)" -ne 'ok') {
+                    $tag = $tag + ' - ' + (Format-Status $active $false)
+                }
+                $card.Controls.Add((New-Label $tag $FONT_SMALL $cSubtle 12 $cy ($cardW - 24) 15 $null))
+                $cy += 18
+            }
         }
         $cy += 4
         $card.Size = Sz $cardW $cy
@@ -1192,8 +1255,12 @@ function Build-Popup {
             $statW = 150
             $nameW = $rowW - $statW - $delW - 4
 
-            # No cached fallback: an account with no fresh bars just says why.
-            $stat = if ($hasData) { 'agora' } else { Format-Status $a $false }
+            # The right-hand tag always dates the numbers on its left: "agora"
+            # for a fresh fetch, the measurement's age when they come from
+            # cswap's lastGoodUsage, the reason when there are none at all.
+            $stat = if (-not $hasData) { Format-Status $a $false }
+                    elseif ($a.Stale)  { Format-StaleTag $a }
+                    else               { 'agora' }
 
             $row.Controls.Add((New-Label "$($a.Num)  $($a.Email)" $FONT_ROW $cMuted 0 0 $nameW 16 $null))
             $row.Controls.Add((New-Label $stat $FONT_SMALL $cSubtle $nameW 1 $statW 15 'TopRight'))
@@ -1206,10 +1273,11 @@ function Build-Popup {
                 $lblW   = 24
                 $pctW   = 34
                 $bx = 0
+                $fill = if ($a.Stale) { $cStale } else { $null }
                 foreach ($b in $bars) {
                     $barW = $slotW - $lblW - $pctW - 4
                     $row.Controls.Add((New-Label $b.Label $FONT_SMALL $cSubtle $bx 21 $lblW 14 $null))
-                    New-Bar $row ($bx + $lblW) 25 $barW 5 ([int]$b.Pct) | Out-Null
+                    New-Bar $row ($bx + $lblW) 25 $barW 5 ([int]$b.Pct) $fill | Out-Null
                     $row.Controls.Add((New-Label ("{0}%" -f [int]$b.Pct) $FONT_SMALL $cMuted ($bx + $lblW + $barW + 2) 20 $pctW 14 'TopRight'))
 
                     # Reset time for this bar - same info the active card shows,
@@ -1357,7 +1425,9 @@ if ($Preview) {
     # DrawToBitmap uses WM_PRINT, so the window has to exist but doesn't have to
     # be on a visible part of the desktop.
     if (-not (Test-Path -LiteralPath $Preview)) { New-Item -ItemType Directory -Force -Path $Preview | Out-Null }
-    $script:data = ConvertFrom-CollectJson (& $script:Collect)
+    # .Accounts, not the envelope: $script:data is the account array everywhere
+    # else, and handing Build-Popup the envelope drew a card for a non-account.
+    $script:data = @((ConvertFrom-CollectJson (& $script:Collect)).Accounts)
     $script:updatedAt = Get-Date
     $script:stale = $false
 
@@ -1372,19 +1442,25 @@ if ($Preview) {
 
     # The ring at its real pixel size, then magnified so the anti-aliasing is
     # actually inspectable.
-    $strip = New-Object System.Drawing.Bitmap(560, 96)
+    # Two rows: live (top) and stale (bottom, grey arc) - the stale ring has no
+    # text to explain itself, so it has to be checkable side by side.
+    $strip = New-Object System.Drawing.Bitmap(560, 184)
     $sg = [System.Drawing.Graphics]::FromImage($strip)
     $sg.Clear([System.Drawing.Color]::FromArgb(24, 24, 27))
     $sg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
     $sg.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
-    $x = 12
-    foreach ($p in @(0, 12, 45, 72, 89, 100)) {
-        $h = New-RingIcon $p $false
-        $ic = [System.Drawing.Icon]::FromHandle($h)
-        $ib = $ic.ToBitmap()
-        $sg.DrawImage($ib, $x, 16, 72, 72)
-        $ib.Dispose(); $ic.Dispose(); [void][Native]::DestroyIcon($h)
-        $x += 88
+    $rowY = 16
+    foreach ($isStale in @($false, $true)) {
+        $x = 12
+        foreach ($p in @(0, 12, 45, 72, 89, 100)) {
+            $h = New-RingIcon $p $isStale
+            $ic = [System.Drawing.Icon]::FromHandle($h)
+            $ib = $ic.ToBitmap()
+            $sg.DrawImage($ib, $x, $rowY, 72, 72)
+            $ib.Dispose(); $ic.Dispose(); [void][Native]::DestroyIcon($h)
+            $x += 88
+        }
+        $rowY += 88
     }
     $sg.Dispose()
     $iconPng = Join-Path $Preview 'icons.png'
@@ -1392,7 +1468,7 @@ if ($Preview) {
     $strip.Dispose()
 
     "popup -> $popupPng ($($popup.ClientSize.Width)x$($popup.ClientSize.Height) px, scale $($script:scale))"
-    "icons -> $iconPng (0, 12, 45, 72, 89, 100 %)"
+    "icons -> $iconPng (0, 12, 45, 72, 89, 100 % - linha 1 ao vivo, linha 2 stale)"
     exit 0
 }
 

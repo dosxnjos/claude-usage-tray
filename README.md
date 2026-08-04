@@ -14,12 +14,16 @@ só para macOS.
   **7d** e — quando o plano mede Opus à parte — de **opus**, cada uma com o
   horário de reset e a contagem regressiva.
 - **Demais contas** do `cswap`, cada uma com as **duas barras** (sessão de 5h e
-  semanal de 7d) e o tempo pro reset de cada uma, quando há dado fresco. Sem
-  dado, a linha só diz o motivo (token expirado / API limitando) — **nunca um
-  número cacheado**.
+  semanal de 7d) e o tempo pro reset de cada uma. Quando o dado é fresco, o canto
+  direito diz `agora`. Quando o `cswap` não tem medição recente mas guardou a
+  última útil (`lastGoodUsage`, cswap 0.24+), as barras aparecem **em cinza** com
+  a idade no lugar do `agora` (`8h atras`). Sem nenhuma medição, a linha só diz o
+  motivo (`re-login preciso`, `API limitando`…). O app **nunca mostra número
+  velho sem dizer que é velho**.
 - **Ícone da bandeja**: um anel que mostra a janela de **sessão (5h)** da conta
   ativa (verde < 60% < âmbar < 85% < vermelho). É o número que responde "vou
-  bater no limite agora?", sem precisar nem do hover.
+  bater no limite agora?", sem precisar nem do hover. Se o valor exibido for uma
+  medição antiga, o anel fica **cinza** — a escala de cor só vale para dado vivo.
 
 ## O que dá pra fazer
 
@@ -38,39 +42,42 @@ naquela conta; nesse caso o app mostra a mensagem dele, em vez de fingir sucesso
 ## Auto-switch de conta
 
 Liga/desliga em **Auto-switch de conta**, no menu do botão direito (padrão:
-**ligado**). Quando ligado, o app troca sozinho para outra conta assim que a
-conta **ativa** trava — sem precisar abrir o popup e clicar.
+**ligado**). Desde 24/07/2026 a decisão e a troca são do **próprio cswap**
+(motor `cswap auto`, introduzido no cswap 0.19+): com o toggle ligado, cada
+refresh roda um tick `cswap auto --once --json` em segundo plano, antes de
+buscar a lista — se houve troca, o popup e o anel já mostram a conta nova no
+mesmo ciclo. O app só traduz os eventos do tick em balões; quem decide,
+executa e guarda estado (cooldown, quarentena) é o cswap.
 
-Regra de decisão, a cada refresh (60s): calcula-se o instante em que cada conta
-fica utilizável de novo —
+A política é a do cswap (defaults; ajuste com `cswap config set autoswitch.*`):
 
-- se a semana (**7d**) dela estiver em 100%, é o reset da 7d que manda (a conta
-  segue travada mesmo que a sessão de 5h já tenha zerado);
-- senão, se a sessão (**5h**) estiver em 100%, é o reset dela;
-- senão, a conta já está utilizável agora.
+- **Proativa:** troca quando a janela vinculante da conta ativa — o pior entre
+  **5h**, **7d** e, nesta máquina, o semanal do **Fable**
+  (`autoswitch.model Fable`) — chega a **90%**, sem esperar cravar 100%.
+  Trocando antes de travar, as sessões Claude vivas pegam a conta nova
+  enquanto a antiga ainda vale.
+- O alvo é a conta com **mais folga**; ela precisa estar abaixo do threshold e
+  superar a ativa em **10 pontos** (histerese anti pingue-pongue). Entre
+  trocas proativas há **cooldown de 5 min** — que deixa de valer quando a
+  ativa crava 100% (aí qualquer conta com folga real serve, já).
+- Antes de ativar o alvo, o cswap **renova o token** dele se estiver perto de
+  expirar; refresh token morto põe a conta em **quarentena** (sai sozinha
+  quando você re-loga nela). Se o uso da ativa ficar ilegível por 3 ticks
+  seguidos, há **failover** para qualquer conta saudável.
+- Conta com sessão `cswap run` viva nunca é alvo automático; `cswap disable N`
+  segura uma conta fora da rotação sem deslogá-la.
 
-Só dispara se a conta **ativa** estiver travada por essa conta. A troca vai
-para a conta elegível com o **menor** desses instantes — em caso de empate, ou
-se a própria ativa já for a "melhor", **não faz nada** (evita ficar
-pingue-pongueando entre contas logo após um reset). Não há cooldown por tempo
-entre trocas: a cada refresh (60s) a regra acima roda de novo do zero sobre o
-dado mais fresco — é isso, sozinho, que evita a oscilação, sem precisar de um
-temporizador extra que só atrapalharia a se recuperar de uma reversão (abaixo).
+Balões: **troca feita** (informativo, com origem → destino e o gatilho),
+**conta em quarentena** (aviso, com o comando de recuperação) e **todas as
+contas esgotadas** (aviso, uma vez por episódio, com o reset mais cedo). O
+resto — abaixo do threshold, histerese não vencida, erro transitório — é
+silêncio; o próximo refresh reavalia.
 
-Um aviso (balão) surge quando a troca **não é confirmada** e some sozinho
-quando a conta ativa volta a ficar utilizável; a tentativa se repete no
-próximo refresh, sem diálogo modal. **Nunca usa `--force`**: forçar ativaria a
-credencial guardada sem primeiro salvar o login vivo, e o refresh token é de
-uso único — se ele tiver girado desde o último backup, o `--force` descarta a
-versão nova e pode quebrar a conta.
-
-**Risco conhecido:** já foi observado (não de forma reprodutível) o `cswap`
-reportar sucesso na troca e, minutos depois, ela reverter sozinha — provável
-efeito de alguma outra sessão do Claude Code (você costuma rodar várias ao
-mesmo tempo) reescrevendo `~/.claude.json` com a própria identidade em cache.
-O app não confia num sucesso passado: cada refresh reconfere do zero se a
-conta ativa ainda está travada, então uma reversão silenciosa é detectada e
-tentada de novo no ciclo seguinte (até 60s depois), sem precisar de você.
+O risco antigo da troca "confirmada" que revertia sozinha morreu com a
+delegação: o processo que decide é o mesmo que escreve, sob os locks do
+cswap. A troca **manual** (clique na linha) continua conferindo o resultado
+no `sequence.json`, como sempre — e continua sem `--force`, que descartaria
+um refresh token fresco e poderia quebrar a conta.
 
 ## De onde vêm os dados
 
@@ -82,7 +89,11 @@ traz três vantagens:
   `cswap --list` renova e reescreve no disco — então a conta volta a mostrar
   dados sem você fazer nada. (Foi por isso que uma conta "morta" voltou depois de
   você rodar `cswap --list` no terminal: não foi coincidência.)
-- **Não toma 429.** O cswap tem cache de 15s, que absorve as chamadas.
+- **Não toma 429.** O orçamento do endpoint de usage é **por access token**, não
+  por processo — quem poller por fora não ganha dado, só divide (e derruba) o
+  mesmo orçamento. O cswap concentra isso num store compartilhado por todas as
+  superfícies dele (list/TUI/watch/auto), com cadência adaptativa e backoff de
+  429; nós lemos o resultado. (Até a 0.19 isso era um cache simples de 15s.)
 - **Traz o uso por modelo.** A linha **Fable** (e outros modelos com limite
   próprio) vem no campo `scoped[]` — que a API de usage crua não expõe pelos
   campos `five_hour`/`seven_day`.
@@ -98,11 +109,18 @@ cswap, não nós.
 ## Contas inativas
 
 O cswap renova o token da conta inativa ao listar, então na maioria das vezes
-elas aparecem com dados. Se ainda assim uma conta não tiver dado fresco, a linha
-mostra só o motivo (`token expirado`, `re-login preciso`, etc.) e encolhe — o app
-**nunca inventa um número cacheado**. Nas linhas compactas aparecem só as duas
-barras que importam de relance (sessão 5h e semanal 7d), cada uma com o tempo
-pro reset embaixo; o detalhe por modelo (Fable) fica no card da conta ativa.
+elas aparecem com dados. Se uma conta não tiver medição fresca, o app tenta a
+última medição útil que o cswap guardou (`lastGoodUsage`) e a desenha **cinza,
+com a idade ao lado**; só quando não existe nem isso a linha encolhe e mostra o
+motivo (`token expirado`, `re-login preciso`, etc.). O que o app não faz é
+**passar número velho por atual** — a idade anda sempre junto do número. Nas
+linhas compactas aparecem só as duas barras que importam de relance (sessão 5h e
+semanal 7d), cada uma com o tempo pro reset embaixo; o detalhe por modelo (Fable)
+fica no card da conta ativa.
+
+> **Requer cswap 0.24+.** O campo `lastGoodUsage` nasceu ali (release 0.24.0,
+> PR #170). Com um cswap mais velho nada quebra: sem o campo, a conta simplesmente
+> volta a mostrar só o motivo, como antes.
 
 ## Como funciona por dentro
 
