@@ -80,13 +80,15 @@ decisões recentes).
    `Get-SessionPct` pega a barra `5h` (fallback: primeira barra). Se mudar para
    "pior janela", quebra o pedido.
 
-   **A partir de `$TAIL_FROM_PCT` (90%) o anel troca de escala:** a faixa
-   90→100 ocupa a volta inteira e um **ponto central** marca que a escala mudou.
+   **A partir de `$TAIL_FROM_PCT` (95%) o anel troca de escala:** a faixa
+   95→100 ocupa a volta inteira e um **ponto central** marca que a escala mudou.
    Motivo medido (04/08/2026, `temp/ring-lab.ps1`): no tamanho real de 16px,
    88/90/93/96/98/100% desenham o **mesmo ícone** — 2% de uso são 7° de arco,
-   menos de um pixel na borda. Descartados na mesma comparação: borda externa
-   vermelha (fina por definição, some no fundo escuro e ainda come pixel do
-   anel) e trilho vermelho (contraste baixo demais sob arco vermelho).
+   menos de um pixel na borda. Com o corte em 95, cada 1% restante vale 72° (um
+   oitavo da volta), que é o que finalmente separa 98 de 99 de 100. Descartados
+   na mesma comparação: borda externa vermelha (fina por definição, some no
+   fundo escuro e ainda come pixel do anel) e trilho vermelho (contraste baixo
+   demais sob arco vermelho).
    ⚠️ **Um limiar só.** Dois ou mais viram escalas que ninguém identifica de
    relance em 16px. O ponto usa a **cor do arco** — em dado stale ele é cinza:
    marca a escala, nunca afirma urgência sozinho.

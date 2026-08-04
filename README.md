@@ -24,8 +24,8 @@ só para macOS.
   ativa (verde < 60% < âmbar < 85% < vermelho). É o número que responde "vou
   bater no limite agora?", sem precisar nem do hover. Se o valor exibido for uma
   medição antiga, o anel fica **cinza** — a escala de cor só vale para dado vivo.
-  **De 90% em diante o anel dá zoom na reta final:** a faixa 90→100 passa a
-  ocupar a volta inteira (95% = meia volta, 98% = quatro quintos) e um **ponto
+  **De 95% em diante o anel dá zoom na reta final:** a faixa 95→100 passa a
+  ocupar a volta inteira (97% = dois quintos, 99% = quatro quintos) e um **ponto
   no centro** avisa que a escala mudou. Sem isso, 98% e 100% são o mesmo desenho
   num ícone de 16 pixels.
 

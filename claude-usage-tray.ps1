@@ -189,10 +189,11 @@ function Get-UsageColor([int]$pct) {
 
 # Where the tray ring switches to its zoomed scale (see New-RingIcon). ONE
 # threshold on purpose: each extra one is another scale the user would have to
-# identify at a glance in 16 pixels. 90 also happens to be where `cswap auto`
-# starts considering a switch, so the icon changes meaning exactly where the
-# engine changes behaviour.
-$TAIL_FROM_PCT = 90
+# identify at a glance in 16 pixels. At 95 the zoomed scale gives each remaining
+# percent 72 degrees of arc - an eighth of the circle - which is what finally
+# separates 98 from 99 from 100. Below it the normal scale still reads fine: at
+# 90% the ring is nearly full AND red, which is unambiguous on its own.
+$TAIL_FROM_PCT = 95
 
 # ---------------------------------------------------------------------------
 # Talking to cswap (the ONLY path that writes credentials)
@@ -742,12 +743,12 @@ function New-RingIcon($pct, [bool]$stale) {
         $p = [math]::Max(0, [math]::Min(100, [int]$pct))
 
         # Above $TAIL_FROM_PCT the ring changes scale: that last stretch takes
-        # the whole circle, so 95% is half a turn and 98% is four fifths. At the
-        # normal scale those readings are the SAME icon - 2% of usage is 7
-        # degrees of arc, under one pixel at 16px, which is the size this thing
-        # actually lives at. The centre dot says "you're reading the zoomed
-        # scale". Colour disambiguates it even if the dot goes unnoticed: at the
-        # normal scale a barely-filled ring is green, never red.
+        # the whole circle, so 97% is two fifths of a turn and 99% is four
+        # fifths. At the normal scale those readings are the SAME icon - 2% of
+        # usage is 7 degrees of arc, under one pixel at 16px, which is the size
+        # this thing actually lives at. The centre dot says "you're reading the
+        # zoomed scale". Colour disambiguates it even if the dot goes unnoticed:
+        # at the normal scale a barely-filled ring is green, never red.
         $tail  = ($p -ge $TAIL_FROM_PCT)
         $shown = if ($tail) { [int](100.0 * ($p - $TAIL_FROM_PCT) / (100.0 - $TAIL_FROM_PCT)) } else { $p }
 
@@ -1483,9 +1484,9 @@ if ($Preview) {
     $rowY = 16
     foreach ($isStale in @($false, $true)) {
         $x = 12
-        # The last four cross $TAIL_FROM_PCT: 89 is the normal scale, 93/96/100
+        # The last four cross $TAIL_FROM_PCT: 93 is the normal scale, 96/98/100
         # are the zoomed one - which is exactly the transition worth eyeballing.
-        foreach ($p in @(0, 45, 72, 89, 93, 96, 100)) {
+        foreach ($p in @(0, 45, 72, 93, 96, 98, 100)) {
             $h = New-RingIcon $p $isStale
             $ic = [System.Drawing.Icon]::FromHandle($h)
             $ib = $ic.ToBitmap()
@@ -1501,7 +1502,7 @@ if ($Preview) {
     $strip.Dispose()
 
     "popup -> $popupPng ($($popup.ClientSize.Width)x$($popup.ClientSize.Height) px, scale $($script:scale))"
-    "icons -> $iconPng (0, 45, 72, 89, 93, 96, 100 % - linha 1 ao vivo, linha 2 stale)"
+    "icons -> $iconPng (0, 45, 72, 93, 96, 98, 100 % - linha 1 ao vivo, linha 2 stale)"
     exit 0
 }
 
