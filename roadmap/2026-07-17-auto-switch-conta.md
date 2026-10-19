@@ -238,3 +238,5 @@ da troca. É a única leitura que não causa flapping, então foi a adotada.
    vez de assumir "utilizável agora" ou "nunca" — indeterminado exclui a conta
    de ser alvo e não dispara troca se for a própria ativa (mais seguro que
    adivinhar).
+
+> Auditado em 2026-09-01 (overhaul): FECHADO — Status EXECUTADO 17/07; decisão local substituída pelo cswap auto em 24/07

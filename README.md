@@ -110,6 +110,26 @@ sessão do claude.ai**.
 O app continua **somente leitura de credenciais**: quem rotaciona/grava token é o
 cswap, não nós.
 
+**E o `/usage` do Claude Code? Avaliado em 25/09/2026 e descartado como fonte.**
+`claude -p "/usage"` (CLI 2.1.282) roda sem chamar o modelo e bate **no mesmo
+endpoint** do cswap (`/api/oauth/usage`): os números conferem, só muda quem
+pergunta. Não serve de fonte porque:
+
+- lê **só a conta logada** naquele `CLAUDE_CONFIG_DIR`;
+- levou **17 s** de relógio (13 s internos) na medição: boot do binário e,
+  provavelmente, a varredura dos transcripts locais para a seção "What's
+  contributing". Inviável a cada 60 s;
+- devolve **texto em inglês sem contrato** (`--output-format json` só embrulha o
+  texto em `result`), parse por regex que quebra a cada versão do CLI;
+- ler outra conta exigiria copiar a credencial do cofre do cswap para outro
+  config dir, e o `/usage` renova token sozinho no 401 (`refreshOAuth`): refresh
+  token é de uso único, então a cópia do cswap morre (`relogin_required`). Token
+  de `claude setup-token` também não serve: só tem escopo `user:inference`, e o
+  `/usage` exige `user:profile`. Um login próprio por conta em config dir
+  dedicado funcionaria em tese (não testado), mas soma um boot de CLI por conta a
+  cada ciclo e não tira o cswap do caminho: o auto-switch continua pollando por
+  ele.
+
 ## Contas inativas
 
 O cswap renova o token da conta inativa ao listar, então na maioria das vezes

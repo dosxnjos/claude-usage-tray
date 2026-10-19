@@ -123,3 +123,5 @@ cinzas + "2d atras", e `icons.png` continua legível.
 Fusão com o cswap upstream (`cswap tray` para Windows, equivalente ao
 `cswap menubar` do macOS) e portabilidade. Discussão e requisitos ficam no
 diário de 2026-08-03; exige reescrita em Python, não é porte do `.ps1`.
+
+> Auditado em 2026-09-01 (overhaul): FECHADO — commit 11b35ce (03/08); lastGoodUsage 9 ocorrências no .ps1
